@@ -12,7 +12,8 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:reset": "prisma db push --force-reset --accept-data-loss",
     "test": "vitest run",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "test:db": "vitest run --config vitest.itest.config.mts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",
