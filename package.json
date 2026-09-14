@@ -13,7 +13,8 @@
     "db:reset": "prisma db push --force-reset --accept-data-loss",
     "test": "vitest run",
     "postinstall": "prisma generate",
-    "test:db": "vitest run --config vitest.itest.config.mts"
+    "test:db": "vitest run --config vitest.itest.config.mts",
+    "agent": "tsx scripts/run-agent.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",
