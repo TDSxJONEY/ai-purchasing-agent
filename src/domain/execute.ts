@@ -16,7 +16,13 @@
  * the case where the world moved between deciding and acting.
  */
 
-import { PoStatus, RunStatus, type PurchaseOrder } from "@prisma/client";
+import {
+  DecisionType,
+  PoStatus,
+  RecommendationStatus,
+  RunStatus,
+  type PurchaseOrder,
+} from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { loadValidationInput } from "./state";
 import {
@@ -140,10 +146,25 @@ export async function executePurchase(
   });
 
   if (validation.passed) {
-    await prisma.agentRun.update({
+    const run = await prisma.agentRun.findUnique({
       where: { id: input.runId },
-      data: { status: RunStatus.VALIDATED, resultPoId: po.id },
+      select: { recommendationId: true },
     });
+
+    await prisma.$transaction([
+      prisma.agentRun.update({
+        where: { id: input.runId },
+        data: { status: RunStatus.VALIDATED, resultPoId: po.id },
+      }),
+      ...(run?.recommendationId
+        ? [
+            prisma.recommendation.update({
+              where: { id: run.recommendationId },
+              data: { status: RecommendationStatus.RESOLVED },
+            }),
+          ]
+        : []),
+    ]);
 
     return { po, validation, rolledBack: false, reused: false, brief: null };
   }
@@ -202,4 +223,105 @@ export async function revalidatePurchaseOrder(
   });
 
   return validation;
+}
+
+const ORDERING = new Set<DecisionType>([
+  DecisionType.ACCEPT,
+  DecisionType.MODIFY,
+  DecisionType.CREATE_SUPPLEMENTARY_PO,
+]);
+
+export async function approveRun(runId: string) {
+  const run = await prisma.agentRun.findUnique({
+    where: { id: runId },
+    include: {
+      decision: true,
+      recommendation: true,
+      triggerPo: true,
+    },
+  });
+
+  if (!run) throw new Error(`Run ${runId} not found.`);
+  if (!run.decision) throw new Error("This run has no decision to approve.");
+
+  if (run.status !== RunStatus.AWAITING_APPROVAL && run.status !== RunStatus.EXECUTING) {
+    const existing = run.resultPoId
+      ? await prisma.purchaseOrder.findUnique({ where: { id: run.resultPoId } })
+      : null;
+    return {
+      executed: ORDERING.has(run.decision.decision),
+      status: run.status,
+      po: existing,
+      validation: null as ValidationOutcome | null,
+      rolledBack: run.status === RunStatus.VALIDATION_FAILED,
+      reused: true,
+      brief: null as string | null,
+    };
+  }
+
+  if (!ORDERING.has(run.decision.decision)) {
+    const nextStatus =
+      run.decision.decision === DecisionType.ESCALATE
+        ? RunStatus.ESCALATED
+        : RunStatus.NO_ACTION;
+
+    await prisma.agentRun.update({
+      where: { id: runId },
+      data: { status: nextStatus },
+    });
+
+    if (run.recommendationId) {
+      await prisma.recommendation.update({
+        where: { id: run.recommendationId },
+        data: { status: RecommendationStatus.RESOLVED },
+      });
+    }
+
+    return {
+      executed: false,
+      status: nextStatus,
+      po: null,
+      validation: null,
+      rolledBack: false,
+      reused: false,
+      brief: null,
+    };
+  }
+
+  const productId = run.recommendation?.productId ?? run.triggerPo?.productId;
+  const nodeId = run.recommendation?.nodeId ?? run.triggerPo?.nodeId;
+  const supplierId = run.decision.supplierId;
+
+  if (!productId || !nodeId) {
+    throw new Error("Run is missing product or node identifiers.");
+  }
+  if (!supplierId) {
+    throw new Error("Cannot execute a purchase without a supplier.");
+  }
+
+  await prisma.agentRun.update({
+    where: { id: runId },
+    data: { status: RunStatus.EXECUTING },
+  });
+
+  const result = await executePurchase({
+    runId,
+    productId,
+    nodeId,
+    supplierId,
+    quantity: run.decision.quantity ?? 0,
+    idempotencyKey: `run-${runId}`,
+    parentPoId: run.triggerPoId,
+    agentStatedQuantity: run.decision.quantity,
+  });
+
+  return {
+    executed: true,
+    status: result.rolledBack ? RunStatus.VALIDATION_FAILED : RunStatus.VALIDATED,
+    po: result.po,
+    validation: result.validation,
+    rolledBack: result.rolledBack,
+    reused: result.reused,
+    brief: result.brief,
+  };
 }

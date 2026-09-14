@@ -1,12 +1,9 @@
 import { DecisionType, RunStatus } from "@prisma/client";
-import { prisma, withRetry } from "@/lib/db";
+import { prisma } from "@/lib/db";
 import { env } from "@/lib/env";
-import { SCENARIO_MAP, isScenarioKey } from "@/lib/scenarios";
-import {
-  framePurchaseReview,
-  frameReinvestigation,
-  frameSupplierShortfall,
-} from "./prompt";
+import { isScenarioKey } from "@/lib/scenarios";
+import { buildScenarioSetup, S2A_PO_ID } from "@/domain/scenarios";
+import { frameReinvestigation } from "./prompt";
 import { createRun } from "./loop";
 
 const ORDERING_DECISIONS = new Set<string>([
@@ -24,63 +21,20 @@ export async function startScenarioRun(scenarioKey: string, mode?: string) {
     throw new Error(`Unknown scenario "${scenarioKey}".`);
   }
 
-  const catalog = SCENARIO_MAP[scenarioKey];
-  let userMessage: string;
-  let recommendationId: string | null = catalog.recommendationId;
-  let triggerPoId: string | null = catalog.triggerPoId;
+  const setup = await buildScenarioSetup(scenarioKey);
 
-  if (catalog.kind === "shortfall") {
-    const po = await withRetry(() =>
-      prisma.purchaseOrder.findUnique({
-        where: { id: catalog.triggerPoId! },
-        include: { product: true, node: true, supplier: true },
-      })
-    );
-    if (!po) throw new Error("S2-A purchase order missing. Run: npm run db:seed");
-
-    triggerPoId = po.id;
-    userMessage = frameSupplierShortfall({
-      purchaseOrderId: po.id,
-      productId: po.productId,
-      productName: po.product.name,
-      nodeId: po.nodeId,
-      nodeName: po.node.name,
-      supplierName: po.supplier.name,
-      orderedQty: po.quantity,
-      confirmedQty: po.confirmedQty ?? 0,
-    });
-  } else {
-    const rec = await withRetry(() =>
-      prisma.recommendation.findUnique({
-        where: { scenarioKey },
-        include: { product: true, node: true },
-      })
-    );
-    if (!rec) throw new Error(`No recommendation "${scenarioKey}". Run: npm run db:seed`);
-
-    recommendationId = rec.id;
-    userMessage = framePurchaseReview({
-      scenarioKey,
-      productId: rec.productId,
-      productName: rec.product.name,
-      productSku: rec.product.sku,
-      nodeId: rec.nodeId,
-      nodeCode: rec.node.code,
-      nodeName: rec.node.name,
-      recommendedQty: rec.recommendedQty,
-    });
-
+  if (setup.recommendationId) {
     await prisma.recommendation.update({
-      where: { id: rec.id },
+      where: { id: setup.recommendationId },
       data: { status: "IN_REVIEW" },
     });
   }
 
   return createRun({
     scenarioKey,
-    recommendationId,
-    triggerPoId,
-    userMessage,
+    recommendationId: setup.recommendationId,
+    triggerPoId: setup.triggerPoId,
+    userMessage: setup.userMessage,
     mode: mode ?? env.AGENT_MODE,
   });
 }
@@ -129,7 +83,7 @@ export async function loadQueue() {
       orderBy: { createdAt: "asc" },
     }),
     prisma.purchaseOrder.findUnique({
-      where: { id: "po_s2a_partial" },
+      where: { id: S2A_PO_ID },
       include: { product: true, node: true, supplier: true },
     }),
     prisma.agentRun.findMany({

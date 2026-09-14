@@ -60,7 +60,7 @@ function asMessages(value: unknown): ChatMessage[] {
 
 function parseArguments(raw: string): {
   ok: boolean;
-  args: Record<string, any>;
+  args: Record<string, unknown>;
   error?: string;
 } {
   if (!raw || raw.trim() === "") return { ok: true, args: {} };
@@ -264,16 +264,16 @@ export async function stepRun(
     if (exec.name === "submit_decision" && exec.ok) {
       const a = exec.args;
 
-      const decision = DECISIONS.has(a.decision) ? a.decision : null;
-      const constraint = CONSTRAINTS.has(a.binding_constraint)
-        ? a.binding_constraint
-        : "NONE";
+      const decisionRaw = typeof a.decision === "string" ? a.decision : "";
+      const constraintRaw =
+        typeof a.binding_constraint === "string" ? a.binding_constraint : "NONE";
+      const decision = DECISIONS.has(decisionRaw) ? decisionRaw : null;
+      const constraint = CONSTRAINTS.has(constraintRaw) ? constraintRaw : "NONE";
 
       if (decision === null) {
-        // Reject the submission and let the model correct itself.
         nextMessages.push({
           role: "user",
-          content: `"${a.decision}" is not a valid decision. Call submit_decision again using one of: ${[...DECISIONS].join(", ")}.`,
+          content: `"${String(a.decision)}" is not a valid decision. Call submit_decision again using one of: ${[...DECISIONS].join(", ")}.`,
         });
         continue;
       }

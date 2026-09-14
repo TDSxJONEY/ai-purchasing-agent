@@ -21,8 +21,15 @@
  *    answered here: none that change state.
  *
  *  - Derived arithmetic that models reliably get wrong (date differences) is
- *    precomputed as DATA — forecastAgeDays is supplied, but no threshold is.
+ *    precomputed as DATA — forecast_age_days is supplied, but no threshold is.
  *    Judging whether that age is acceptable remains the agent's call.
+ *
+ * IDENTIFIER RESOLUTION: an observed failure mode is the model passing a SKU
+ * ("SKU-EARBUD-01") or node code ("DEL-NCR-01") where an id was expected, then
+ * reading the resulting empty result as "no data exists" and deciding on that
+ * false premise. Silent not-found is a dangerous failure here, so every lookup
+ * resolves by id OR sku/code, and an unresolvable identifier returns an explicit
+ * error naming what was tried rather than an innocuous "not found".
  */
 
 import { PoStatus } from "@prisma/client";
@@ -41,7 +48,43 @@ export interface ToolDefinition {
   };
   /** True for the terminal tool that ends the loop. */
   terminal?: boolean;
-  handler: (args: Record<string, any>) => Promise<unknown>;
+  handler: (args: Record<string, unknown>) => Promise<unknown>;
+}
+
+// ─── Identifier resolution ──────────────────────────────────────────────────
+
+async function resolveProductId(raw: unknown): Promise<string | null> {
+  const value = String(raw ?? "").trim();
+  if (!value) return null;
+
+  const product = await withRetry(() =>
+    prisma.product.findFirst({
+      where: { OR: [{ id: value }, { sku: value }] },
+      select: { id: true },
+    })
+  );
+  return product?.id ?? null;
+}
+
+async function resolveNodeId(raw: unknown): Promise<string | null> {
+  const value = String(raw ?? "").trim();
+  if (!value) return null;
+
+  const node = await withRetry(() =>
+    prisma.node.findFirst({
+      where: { OR: [{ id: value }, { code: value }] },
+      select: { id: true },
+    })
+  );
+  return node?.id ?? null;
+}
+
+function unresolved(kind: "product" | "node", raw: unknown) {
+  return {
+    error: `No ${kind} matches "${String(raw)}". Use the ${kind} ID exactly as given in the situation description. Do not substitute the ${
+      kind === "product" ? "SKU" : "node code"
+    } or name.`,
+  };
 }
 
 // ─── Read tools ─────────────────────────────────────────────────────────────
@@ -60,14 +103,27 @@ const getInventory: ToolDefinition = {
     additionalProperties: false,
   },
   handler: async ({ product_id, node_id }) => {
+    const productId = await resolveProductId(product_id);
+    if (!productId) return unresolved("product", product_id);
+    const nodeId = await resolveNodeId(node_id);
+    if (!nodeId) return unresolved("node", node_id);
+
     const inv = await withRetry(() =>
       prisma.inventory.findUnique({
-        where: { productId_nodeId: { productId: product_id, nodeId: node_id } },
+        where: { productId_nodeId: { productId, nodeId } },
       })
     );
+
     if (!inv) {
-      return { found: false, note: "No inventory record for this product and node." };
+      return {
+        found: false,
+        note: "This product and node are both valid, but no stock record exists for the pair. Treat on-hand as zero.",
+        on_hand: 0,
+        reserved: 0,
+        available: 0,
+      };
     }
+
     return {
       found: true,
       on_hand: inv.onHand,
@@ -91,12 +147,23 @@ const getDemandForecast: ToolDefinition = {
     additionalProperties: false,
   },
   handler: async ({ product_id, node_id }) => {
+    const productId = await resolveProductId(product_id);
+    if (!productId) return unresolved("product", product_id);
+    const nodeId = await resolveNodeId(node_id);
+    if (!nodeId) return unresolved("node", node_id);
+
     const f = await withRetry(() =>
       prisma.demandForecast.findUnique({
-        where: { productId_nodeId: { productId: product_id, nodeId: node_id } },
+        where: { productId_nodeId: { productId, nodeId } },
       })
     );
-    if (!f) return { found: false, note: "No forecast on file." };
+
+    if (!f) {
+      return {
+        found: false,
+        note: "No forecast on file for this product and node. There is no demand evidence to reason from.",
+      };
+    }
 
     return {
       found: true,
@@ -124,11 +191,16 @@ const getOpenPurchaseOrders: ToolDefinition = {
     additionalProperties: false,
   },
   handler: async ({ product_id, node_id }) => {
+    const productId = await resolveProductId(product_id);
+    if (!productId) return unresolved("product", product_id);
+    const nodeId = await resolveNodeId(node_id);
+    if (!nodeId) return unresolved("node", node_id);
+
     const pos = await withRetry(() =>
       prisma.purchaseOrder.findMany({
         where: {
-          productId: product_id,
-          nodeId: node_id,
+          productId,
+          nodeId,
           status: { in: [PoStatus.OPEN, PoStatus.PARTIAL] },
         },
         include: { supplier: true },
@@ -138,11 +210,24 @@ const getOpenPurchaseOrders: ToolDefinition = {
 
     return {
       count: pos.length,
+      total_units_arriving: pos.reduce(
+        (sum, po) =>
+          sum +
+          (po.status === PoStatus.PARTIAL && po.confirmedQty !== null
+            ? po.confirmedQty
+            : po.quantity),
+        0
+      ),
       orders: pos.map((po) => ({
         purchase_order_id: po.id,
+        supplier_id: po.supplierId,
         supplier: po.supplier.name,
         ordered_quantity: po.quantity,
         confirmed_quantity: po.confirmedQty,
+        units_that_will_actually_arrive:
+          po.status === PoStatus.PARTIAL && po.confirmedQty !== null
+            ? po.confirmedQty
+            : po.quantity,
         status: po.status,
         unit_price: po.unitPrice,
         expected_date: po.expectedDate.toISOString().slice(0, 10),
@@ -168,9 +253,12 @@ const getSupplierTerms: ToolDefinition = {
     additionalProperties: false,
   },
   handler: async ({ product_id }) => {
+    const productId = await resolveProductId(product_id);
+    if (!productId) return unresolved("product", product_id);
+
     const terms = await withRetry(() =>
       prisma.supplierTerm.findMany({
-        where: { productId: product_id },
+        where: { productId },
         include: { supplier: true },
         orderBy: { leadTimeDays: "asc" },
       })
@@ -204,10 +292,15 @@ const getNodeConstraints: ToolDefinition = {
     additionalProperties: false,
   },
   handler: async ({ node_id }) => {
+    const nodeId = await resolveNodeId(node_id);
+    if (!nodeId) return unresolved("node", node_id);
+
     const c = await withRetry(() =>
-      prisma.nodeConstraint.findUnique({ where: { nodeId: node_id } })
+      prisma.nodeConstraint.findUnique({ where: { nodeId } })
     );
-    if (!c) return { found: false, note: "No constraints on file for this node." };
+    if (!c) {
+      return { found: false, note: "No constraints on file for this node." };
+    }
 
     return {
       found: true,
@@ -217,7 +310,7 @@ const getNodeConstraints: ToolDefinition = {
       storage_capacity_units: c.storageCapacity,
       storage_used_units: c.storageUsed,
       storage_free_units: c.storageCapacity - c.storageUsed,
-      note: "Storage free does not account for stock already on order, which will occupy the same space on arrival.",
+      note: "storage_free_units counts only stock physically in the building. Units already on order are NOT deducted here, and they will need space in this same building when they arrive.",
     };
   },
 };
@@ -229,7 +322,10 @@ const getPurchaseOrder: ToolDefinition = {
   parameters: {
     type: "object",
     properties: {
-      purchase_order_id: { type: "string", description: "Purchase order identifier" },
+      purchase_order_id: {
+        type: "string",
+        description: "Purchase order identifier",
+      },
     },
     required: ["purchase_order_id"],
     additionalProperties: false,
@@ -237,11 +333,15 @@ const getPurchaseOrder: ToolDefinition = {
   handler: async ({ purchase_order_id }) => {
     const po = await withRetry(() =>
       prisma.purchaseOrder.findUnique({
-        where: { id: purchase_order_id },
+        where: { id: String(purchase_order_id ?? "").trim() },
         include: { supplier: true, product: true, node: true },
       })
     );
-    if (!po) return { found: false, note: "No such purchase order." };
+    if (!po) {
+      return {
+        error: `No purchase order matches "${purchase_order_id}". Use the purchase order ID exactly as given in the situation description.`,
+      };
+    }
 
     return {
       found: true,
@@ -255,7 +355,9 @@ const getPurchaseOrder: ToolDefinition = {
       ordered_quantity: po.quantity,
       confirmed_quantity: po.confirmedQty,
       shortfall:
-        po.confirmedQty === null ? 0 : Math.max(0, po.quantity - po.confirmedQty),
+        po.confirmedQty === null
+          ? 0
+          : Math.max(0, po.quantity - po.confirmedQty),
       unit_price: po.unitPrice,
       status: po.status,
       expected_date: po.expectedDate.toISOString().slice(0, 10),
@@ -284,23 +386,31 @@ const submitDecision: ToolDefinition = {
           "ESCALATE",
         ],
         description:
-          "ACCEPT the recommended quantity, MODIFY it to a different quantity, REJECT buying anything, INVESTIGATE when the evidence is not good enough to commit spend, CREATE_SUPPLEMENTARY_PO to cover a supplier shortfall, NO_ACTION when existing cover is sufficient, or ESCALATE to a human when no acceptable option exists.",
+          "Reviewing a recommendation: ACCEPT the recommended quantity unchanged, MODIFY it to a different quantity, REJECT to buy nothing at all, or INVESTIGATE when the demand evidence is too weak to justify committing money. Handling a supplier shortfall: CREATE_SUPPLEMENTARY_PO to source the gap elsewhere, or NO_ACTION when existing cover is already sufficient. ESCALATE only when no acceptable option exists and a human must intervene.",
       },
       quantity: {
         type: "integer",
         description:
-          "Units to order. Use 0 for REJECT, NO_ACTION, ESCALATE or INVESTIGATE. Must respect the supplier's minimum order quantity and be a whole multiple of the lot size.",
+          "Units to order. Use 0 for REJECT, NO_ACTION, ESCALATE or INVESTIGATE. Must be at least the supplier's minimum order quantity and a whole multiple of the lot size.",
       },
       supplier_id: {
         type: "string",
         description:
-          "Identifier of the supplier to order from. Use an empty string when not ordering.",
+          "The supplier_id value returned by get_supplier_terms, for the supplier you are ordering from. Use an empty string when not ordering.",
       },
       binding_constraint: {
         type: "string",
-        enum: ["DEMAND", "STORAGE", "BUDGET", "MOQ", "EVIDENCE", "LEAD_TIME", "NONE"],
+        enum: [
+          "DEMAND",
+          "STORAGE",
+          "BUDGET",
+          "MOQ",
+          "EVIDENCE",
+          "LEAD_TIME",
+          "NONE",
+        ],
         description:
-          "The single factor that actually determined the outcome. If you reduced a quantity, this is what forced the reduction.",
+          "The single factor that actually determined the outcome. If you reduced a quantity, this is what forced the reduction. If no order is possible because the supplier's minimum cannot be reached, it is MOQ. If you are not acting because demand is already covered, it is DEMAND. If you are not acting because the forecast cannot be trusted, it is EVIDENCE.",
       },
       urgent: {
         type: "boolean",
@@ -373,7 +483,7 @@ export function toolsForRequest() {
  */
 export async function executeTool(
   name: string,
-  args: Record<string, any>
+  args: Record<string, unknown>
 ): Promise<{ ok: boolean; result: unknown }> {
   const tool = TOOL_MAP[name];
   if (!tool) {

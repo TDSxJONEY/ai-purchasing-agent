@@ -104,7 +104,7 @@
             "id": "call_ae6a2911bc2b4363acdbf8ef",
             "function": {
               "name": "submit_decision",
-              "arguments": "{\"decision\": \"MODIFY\", \"quantity\": 325, \"supplier_id\": \"sup_meridian\", \"binding_constraint\": \"BUDGET\", \"urgent\": true, \"rationale\": \"System recommended 300 units, but actual sales (320 in 7 days) run 60% above the stale 21-day-old forecast (400 over 14 days). With 180 units on hand and a 7-day lead time, stock will run out in ~4 days before delivery arrives — this is urgent. Ordering 325 units (max in lot-size multiples within budget) provides better coverage against the actual demand rate. Cost: 325 × ₹1,200 = ₹390,000, within the ₹400,000 budget. Storage: 325 ≤ 520 free units. Valid multiple of lot size 25 and above MOQ 50.\", \"factors\": [\"Actual sales 320 units in 7 days vs forecast of ~200 — demand 60% higher than forecast\"]}"
+              "arguments": "{\"decision\": \"INVESTIGATE\", \"quantity\": 0, \"supplier_id\": \"\", \"binding_constraint\": \"EVIDENCE\", \"urgent\": true, \"rationale\": \"The forecast is 21 days old and last-week sales of 320 diverge about 60% from the implied 14-day run-rate. That is not a trustworthy demand figure, so no quantity should be committed until the forecast is refreshed.\", \"factors\": [\"Forecast last updated 21 days ago\", \"Actual 7-day sales 320 vs forecast run-rate about 200\", \"Divergence well above a comfortable tolerance\", \"No purchase until demand evidence is refreshed\"]}"
             }
           }
         ],
