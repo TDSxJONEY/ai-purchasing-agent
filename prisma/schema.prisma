@@ -1,0 +1,271 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────
+
+enum PoStatus {
+  DRAFT
+  OPEN
+  PARTIAL
+  CANCELLED
+  RECEIVED
+}
+
+enum RecommendationStatus {
+  PENDING
+  IN_REVIEW
+  RESOLVED
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  AWAITING_APPROVAL
+  EXECUTING
+  VALIDATED
+  VALIDATION_FAILED
+  ESCALATED
+  NO_ACTION
+  FAILED
+}
+
+enum DecisionType {
+  ACCEPT
+  MODIFY
+  REJECT
+  INVESTIGATE
+  CREATE_SUPPLEMENTARY_PO
+  NO_ACTION
+  ESCALATE
+}
+
+enum BindingConstraint {
+  DEMAND
+  STORAGE
+  BUDGET
+  MOQ
+  EVIDENCE
+  LEAD_TIME
+  NONE
+}
+
+// ─── Operational data ─────────────────────────────────────────────────────
+
+model Product {
+  id        String   @id @default(cuid())
+  sku       String   @unique
+  name      String
+  category  String?
+  createdAt DateTime @default(now())
+
+  inventory       Inventory[]
+  forecasts       DemandForecast[]
+  supplierTerms   SupplierTerm[]
+  purchaseOrders  PurchaseOrder[]
+  recommendations Recommendation[]
+}
+
+model Node {
+  id   String  @id @default(cuid())
+  code String  @unique
+  name String
+  city String?
+
+  inventory       Inventory[]
+  forecasts       DemandForecast[]
+  purchaseOrders  PurchaseOrder[]
+  recommendations Recommendation[]
+  constraint      NodeConstraint?
+}
+
+model Inventory {
+  id        String   @id @default(cuid())
+  productId String
+  nodeId    String
+  onHand    Int
+  reserved  Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id])
+  node    Node    @relation(fields: [nodeId], references: [id])
+
+  @@unique([productId, nodeId])
+}
+
+// NOTE: `updatedAt` here is deliberately NOT @updatedAt. The evidence gate in
+// docs/decision-spec.md §2 keys off forecast staleness, so scenario S1-D must be
+// able to seed a date 21 days in the past. An @updatedAt field would overwrite it.
+model DemandForecast {
+  id            String   @id @default(cuid())
+  productId     String
+  nodeId        String
+  horizonDays   Int
+  forecastUnits Int
+  safetyStock   Int      @default(0)
+  actualLast7d  Int      @default(0)
+  updatedAt     DateTime
+
+  product Product @relation(fields: [productId], references: [id])
+  node    Node    @relation(fields: [nodeId], references: [id])
+
+  @@unique([productId, nodeId])
+}
+
+model Supplier {
+  id               String @id @default(cuid())
+  name             String @unique
+  reliabilityScore Float  @default(1.0)
+
+  terms          SupplierTerm[]
+  purchaseOrders PurchaseOrder[]
+  decisions      AgentDecision[]
+}
+
+// Prices are integer rupees, not Decimal/Float. Decimal serialises awkwardly into
+// JSON for tool results, and floats introduce rounding drift into budget checks
+// that must agree exactly between rules.ts and validate.ts.
+model SupplierTerm {
+  id           String @id @default(cuid())
+  supplierId   String
+  productId    String
+  unitPrice    Int
+  moq          Int
+  lotSize      Int    @default(1)
+  leadTimeDays Int
+
+  supplier Supplier @relation(fields: [supplierId], references: [id])
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@unique([supplierId, productId])
+}
+
+model NodeConstraint {
+  id              String @id @default(cuid())
+  nodeId          String @unique
+  budgetTotal     Int
+  budgetUsed      Int    @default(0)
+  storageCapacity Int
+  storageUsed     Int    @default(0)
+
+  node Node @relation(fields: [nodeId], references: [id])
+}
+
+model PurchaseOrder {
+  id             String   @id @default(cuid())
+  productId      String
+  nodeId         String
+  supplierId     String
+  quantity       Int
+  confirmedQty   Int?
+  unitPrice      Int
+  status         PoStatus @default(DRAFT)
+  expectedDate   DateTime
+  idempotencyKey String?  @unique
+  parentPoId     String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  product  Product  @relation(fields: [productId], references: [id])
+  node     Node     @relation(fields: [nodeId], references: [id])
+  supplier Supplier @relation(fields: [supplierId], references: [id])
+
+  parentPo PurchaseOrder?  @relation("PoLineage", fields: [parentPoId], references: [id])
+  childPos PurchaseOrder[] @relation("PoLineage")
+
+  triggeredRuns AgentRun[]         @relation("RunTriggerPo")
+  resultingRuns AgentRun[]         @relation("RunResultPo")
+  validations   ValidationResult[]
+}
+
+model Recommendation {
+  id             String               @id @default(cuid())
+  scenarioKey    String               @unique
+  productId      String
+  nodeId         String
+  recommendedQty Int
+  source         String               @default("replenishment-system")
+  status         RecommendationStatus @default(PENDING)
+  createdAt      DateTime             @default(now())
+
+  product Product    @relation(fields: [productId], references: [id])
+  node    Node       @relation(fields: [nodeId], references: [id])
+  runs    AgentRun[]
+}
+
+// ─── Agent state ──────────────────────────────────────────────────────────
+
+// `messages` holds the full OpenAI-format message array. This is what makes the
+// stepped loop possible: each /step request reloads it, appends one turn, saves.
+// No agent state lives in process memory between requests.
+model AgentRun {
+  id               String    @id @default(cuid())
+  scenarioKey      String
+  recommendationId String?
+  triggerPoId      String?
+  resultPoId       String?
+  status           RunStatus @default(PENDING)
+  mode             String    @default("live")
+  model            String?
+  stepCount        Int       @default(0)
+  messages         Json      @default("[]")
+  error            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  recommendation Recommendation? @relation(fields: [recommendationId], references: [id])
+  triggerPo      PurchaseOrder?  @relation("RunTriggerPo", fields: [triggerPoId], references: [id])
+  resultPo       PurchaseOrder?  @relation("RunResultPo", fields: [resultPoId], references: [id])
+
+  steps       AgentStep[]
+  decision    AgentDecision?
+  validations ValidationResult[]
+}
+
+model AgentStep {
+  id        String   @id @default(cuid())
+  runId     String
+  index     Int
+  type      String
+  name      String?
+  payload   Json
+  createdAt DateTime @default(now())
+
+  run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, index])
+}
+
+model AgentDecision {
+  id                String            @id @default(cuid())
+  runId             String            @unique
+  decision          DecisionType
+  quantity          Int?
+  supplierId        String?
+  bindingConstraint BindingConstraint @default(NONE)
+  urgent            Boolean           @default(false)
+  rationale         String
+  factors           Json              @default("[]")
+  createdAt         DateTime          @default(now())
+
+  run      AgentRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  supplier Supplier? @relation(fields: [supplierId], references: [id])
+}
+
+model ValidationResult {
+  id        String   @id @default(cuid())
+  runId     String
+  poId      String?
+  passed    Boolean
+  checks    Json
+  createdAt DateTime @default(now())
+
+  run AgentRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  po  PurchaseOrder? @relation(fields: [poId], references: [id])
+}
